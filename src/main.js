@@ -1,5 +1,5 @@
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset, RequestList } from 'crawlee';
+import { CheerioCrawler } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import { gotScraping } from 'got-scraping';
 
@@ -481,7 +481,7 @@ try {
               scrapedAt: new Date().toISOString(),
             };
 
-            await Dataset.pushData(jobData);
+            await Actor.pushData(jobData);
             itemCount++;
             reqLog.info(`✅ Saved job: ${jobData.title} at ${jobData.company} (${itemCount}/${maxItems})`);
           }
@@ -501,7 +501,7 @@ try {
                 scrapedAt: new Date().toISOString(),
               };
 
-              await Dataset.pushData(jobData);
+              await Actor.pushData(jobData);
               itemCount++;
               reqLog.info(`✅ Saved job: ${job.title} at ${job.company} (${itemCount}/${maxItems})`);
 
@@ -543,7 +543,7 @@ try {
       // DETAIL PAGE (optional)
       if (userData.label === 'DETAIL') {
         const jobDetail = extractJobDetail($, url, userData.jobId);
-        await Dataset.pushData({
+        await Actor.pushData({
           ...jobDetail,
           scrapedAt: new Date().toISOString(),
         });
