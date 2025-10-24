@@ -144,6 +144,92 @@ function extractSalaryFromJsonLd(baseSalary) {
 }
 
 /**
+ * Extract job listings from Next.js streamed payload (jobListData)
+ */
+function extractJobsFromNextData(html, baseUrl) {
+  if (!html || typeof html !== 'string') return [];
+
+  const key = '"jobListData":';
+  const keyIndex = html.indexOf(key);
+  if (keyIndex === -1) return [];
+
+  let index = keyIndex + key.length;
+  while (index < html.length && /\s/.test(html[index])) index++;
+  if (html[index] !== '[') return [];
+
+  const start = index;
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+  let end = -1;
+
+  for (let i = start; i < html.length; i++) {
+    const char = html[i];
+
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      isEscaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === '[') depth++;
+    if (char === ']') {
+      depth--;
+      if (depth === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (end === -1) return [];
+
+  const jsonSlice = html.slice(start, end);
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonSlice);
+  } catch (error) {
+    log.debug(`Failed to parse jobListData JSON: ${error.message}`);
+    return [];
+  }
+
+  if (!Array.isArray(parsed)) return [];
+
+  const seenIds = new Set();
+
+  return parsed
+    .filter(job => job && typeof job === 'object')
+    .map(job => ({
+      id: job.id || job.system_legacy_id || null,
+      title: job.source_title || job.distilled_title || job.title || '',
+      company: job.enrich_company_name || job.source_company_name || job.company || '',
+      location: job.source_location || job.enrich_geo_city || '',
+      jobType: Array.isArray(job.enrich_jobtype) ? job.enrich_jobtype.join(', ') : job.employmentType || '',
+      salary: job.enrich_salary_snippet || job.salary || '',
+      description: (job.source_jobdesc_text || job.description || '').substring(0, 500),
+      datePosted: job.system_date_found || job.datePosted || '',
+      url: resolveUrl(job.source_link || job.url || '', baseUrl),
+    }))
+    .filter(job => {
+      if (!job.title || !job.url) return false;
+      if (seenIds.has(job.url)) return false;
+      seenIds.add(job.url);
+      return true;
+    });
+}
+
+/**
  * Extract job data from DOM using flexible selectors with fallbacks
  * Multiple selector strategies for resilience against HTML changes
  */
@@ -153,6 +239,8 @@ function extractJobsFromDOM($, baseUrl) {
 
   // Primary job card selectors (tested on talent.com)
   const cardSelectors = [
+    '[data-testid="JobCardContainer"]',
+    'header[data-testid="JobCard"]',
     'article',
     '[class*="job-card"]',
     '[class*="job-listing"]',
@@ -169,16 +257,26 @@ function extractJobsFromDOM($, baseUrl) {
 
   jobCards.each((_index, element) => {
     const $el = $(element);
+    const $container = $el.is('[data-testid="JobCardContainer"]') ? $el : $el.find('[data-testid="JobCardContainer"]').first() || $el;
+    const infoTexts = $container
+      .find('span')
+      .map((_idx, node) => $(node).text().trim())
+      .get()
+      .map(text => text.replace(/\s+/g, ' '))
+      .filter(text => text && !/this job offer is not available/i.test(text));
 
     // Extract title with multiple fallbacks
-    const titleSelectors = ['h2 a', 'h3 a', 'a.job-link', 'a[href*="/view?id="]'];
+    const titleSelectors = ['h2 a', 'h3 a', 'a.job-link', 'a[href*="/view?id="]', 'h2', 'h3'];
     let titleEl = null;
     let href = null;
 
     for (const selector of titleSelectors) {
-      titleEl = $el.find(selector).first();
+      titleEl = $container.find(selector).first();
+      if (titleEl.length > 0 && titleEl.is('h2, h3') && titleEl.find('a').length > 0) {
+        titleEl = titleEl.find('a').first();
+      }
       if (titleEl.length > 0) {
-        href = titleEl.attr('href') || $el.find('a').first().attr('href');
+        href = titleEl.attr('href') || $container.closest('a').attr('href') || $container.find('a[href*="/view?id="]').first().attr('href');
         break;
       }
     }
@@ -201,11 +299,14 @@ function extractJobsFromDOM($, baseUrl) {
     ];
     let company = '';
     for (const selector of companySelectors) {
-      const el = $el.find(selector).first();
+      const el = $container.find(selector).filter((_, node) => $(node).text().trim().length > 0).first();
       if (el.length > 0) {
         company = el.text().trim();
         break;
       }
+    }
+    if (!company && infoTexts.length > 0) {
+      company = infoTexts[0];
     }
 
     // Extract location
@@ -216,15 +317,22 @@ function extractJobsFromDOM($, baseUrl) {
     ];
     let location = '';
     for (const selector of locationSelectors) {
-      const el = $el.find(selector).first();
+      const el = $container.find(selector).first();
       if (el.length > 0) {
-        location = el.text().trim();
-        break;
+        const candidate = el.text().trim();
+        if (candidate) {
+          location = candidate;
+          if (/,/.test(location) || /remote/i.test(location)) break;
+        }
       }
+    }
+    if (!location) {
+      const locationCandidate = infoTexts.slice(1).find(text => text.includes(',') || /remote/i.test(text));
+      if (locationCandidate) location = locationCandidate;
     }
 
     // Extract job types (Full-time, Part-time, Remote, etc.)
-    const jobTypeElements = $el.find('[class*="badge"], [class*="tag"], [class*="employment"]');
+    const jobTypeElements = $container.find('[data-testid="badge"], [class*="badge"], [class*="tag"], [class*="employment"]');
     const jobTypes = [];
     jobTypeElements.each((_idx, typeElement) => {
       const type = $(typeElement).text().trim();
@@ -234,11 +342,12 @@ function extractJobsFromDOM($, baseUrl) {
     });
 
     // Extract salary if present in title
-    const salaryMatch = title.match(/\$[\d,]+\s*[-–]\s*\$[\d,]+/);
+    const salaryMatch = title.match(/\$[\d,]+\s*[--]\s*\$[\d,]+/);
     const salary = salaryMatch ? salaryMatch[0] : null;
 
     // Extract snippet/description
     const snippetSelectors = [
+      '[data-testid="JobCardDescription"]',
       '[class*="snippet"]',
       '[class*="summary"]',
       '[class*="description"]',
@@ -246,7 +355,7 @@ function extractJobsFromDOM($, baseUrl) {
     ];
     let snippet = '';
     for (const selector of snippetSelectors) {
-      const el = $el.find(selector).first();
+      const el = $container.find(selector).first();
       if (el.length > 0) {
         snippet = el.text().trim();
         if (snippet.length > 20) break;
@@ -255,17 +364,22 @@ function extractJobsFromDOM($, baseUrl) {
 
     // Extract posted date
     const dateSelectors = [
+      '[data-testid="JobCardContainer"] time',
       '[class*="date"]',
       'time',
       '[class*="posted"]',
     ];
     let postedDate = '';
     for (const selector of dateSelectors) {
-      const el = $el.find(selector).first();
+      const el = $container.find(selector).first();
       if (el.length > 0) {
         postedDate = el.text().trim();
         break;
       }
+    }
+    if (!postedDate) {
+      const dateCandidate = infoTexts.find(text => /\bday\b|\bweek\b|\bmonth\b|ago/i.test(text));
+      if (dateCandidate) postedDate = dateCandidate;
     }
 
     jobs.push({
@@ -474,6 +588,11 @@ try {
 
     async requestHandler({ request, $, response, enqueueLinks, log: reqLog }) {
       const { url, userData } = request;
+      const responseBody = typeof response?.body === 'string'
+        ? response.body
+        : Buffer.isBuffer(response?.body)
+          ? response.body.toString('utf8')
+          : '';
 
       // ✅ ANTI-SCRAPING: Realistic delay between requests
       await delayRequest(delayBetweenRequests, delayBetweenRequests + 2000);
@@ -487,26 +606,24 @@ try {
           return;
         }
 
-        // ✅ Strategy 1: JSON-LD extraction (most reliable)
-        const jsonLdJobs = extractJobPostingsFromJsonLd($);
+        // ✅ Strategy 1: Next.js payload extraction
+        const nextDataJobs = extractJobsFromNextData(responseBody, url);
 
-        if (jsonLdJobs.length > 0) {
-          reqLog.info(`Page ${userData.page}: Found ${jsonLdJobs.length} jobs via JSON-LD`);
+        if (nextDataJobs.length > 0) {
+          reqLog.info(`Page ${userData.page}: Found ${nextDataJobs.length} jobs via Next.js payload`);
 
-          for (const job of jsonLdJobs) {
+          for (const job of nextDataJobs) {
             if (itemCount >= maxItems) break;
-
-            const jobUrl = resolveUrl(job.url, url) || url;
 
             const jobData = {
               title: job.title || '',
-              company: job.hiringOrganization?.name || '',
-              location: extractLocationFromJsonLd(job.jobLocation),
-              jobType: job.employmentType || 'Not specified',
-              salary: extractSalaryFromJsonLd(job.baseSalary) || 'Not specified',
-              description: (job.description || '').substring(0, 500),
+              company: job.company || '',
+              location: job.location || '',
+              jobType: job.jobType || 'Not specified',
+              salary: job.salary || 'Not specified',
+              description: job.description || '',
               datePosted: job.datePosted || '',
-              url: jobUrl,
+              url: job.url || url,
               source: 'talent.com',
               scrapedAt: new Date().toISOString(),
             };
@@ -516,45 +633,77 @@ try {
             reqLog.info(`✅ Saved job: ${jobData.title} at ${jobData.company} (${itemCount}/${maxItems})`);
           }
         } else {
-          // ✅ Strategy 2: DOM extraction (fallback)
-          reqLog.info(`Page ${userData.page}: Trying DOM extraction...`);
-          const domJobs = extractJobsFromDOM($, url);
+          // ✅ Strategy 2: JSON-LD extraction (fallback)
+          const jsonLdJobs = extractJobPostingsFromJsonLd($);
 
-          if (domJobs.length > 0) {
-            reqLog.info(`Page ${userData.page}: Found ${domJobs.length} jobs via DOM`);
+          if (jsonLdJobs.length > 0) {
+            reqLog.info(`Page ${userData.page}: Found ${jsonLdJobs.length} jobs via JSON-LD`);
 
-            for (const job of domJobs) {
+            for (const job of jsonLdJobs) {
               if (itemCount >= maxItems) break;
 
+              const jobUrl = resolveUrl(job.url, url) || url;
+
               const jobData = {
-                ...job,
+                title: job.title || '',
+                company: job.hiringOrganization?.name || '',
+                location: extractLocationFromJsonLd(job.jobLocation),
+                jobType: job.employmentType || 'Not specified',
+                salary: extractSalaryFromJsonLd(job.baseSalary) || 'Not specified',
+                description: (job.description || '').substring(0, 500),
+                datePosted: job.datePosted || '',
+                url: jobUrl,
+                source: 'talent.com',
                 scrapedAt: new Date().toISOString(),
               };
 
               await Actor.pushData(jobData);
               itemCount++;
-              reqLog.info(`✅ Saved job: ${job.title} at ${job.company} (${itemCount}/${maxItems})`);
-
-              // Optionally enqueue detail pages
-              if (includeJobDetails && job.url) {
-                await enqueueLinks({
-                  urls: [job.url],
-                  userData: {
-                    label: 'DETAIL',
-                    jobId: job.url.split('id=')[1] || Math.random().toString(36).substring(7),
-                  },
-                });
-              }
+              reqLog.info(`✅ Saved job: ${jobData.title} at ${jobData.company} (${itemCount}/${maxItems})`);
             }
           } else {
-            reqLog.warning(`Page ${userData.page}: No jobs found. Check selectors or site structure.`);
+            // ✅ Strategy 3: DOM extraction (last resort)
+            reqLog.info(`Page ${userData.page}: Trying DOM extraction...`);
+            const domJobs = extractJobsFromDOM($, url);
+
+            if (domJobs.length > 0) {
+              reqLog.info(`Page ${userData.page}: Found ${domJobs.length} jobs via DOM`);
+
+              for (const job of domJobs) {
+                if (itemCount >= maxItems) break;
+
+                const jobData = {
+                  ...job,
+                  scrapedAt: new Date().toISOString(),
+                };
+
+                await Actor.pushData(jobData);
+                itemCount++;
+                reqLog.info(`✅ Saved job: ${job.title} at ${job.company} (${itemCount}/${maxItems})`);
+
+                if (includeJobDetails && job.url) {
+                  await enqueueLinks({
+                    urls: [job.url],
+                    userData: {
+                      label: 'DETAIL',
+                      jobId: job.url.split('id=')[1] || Math.random().toString(36).substring(7),
+                    },
+                  });
+                }
+              }
+            } else {
+              reqLog.warning(`Page ${userData.page}: No jobs found. Check selectors or site structure.`);
+            }
           }
         }
 
         // Check if there's a next page
-        const nextPageLink = $('a[aria-label*="Next"]').attr('href') || 
-                             $('a:contains("Next")').attr('href') ||
-                             $('a.next').attr('href');
+        const nextPageNumber = (userData.page || 1) + 1;
+        const explicitNextSelector = `a[href*="p=${nextPageNumber}"]`;
+        let nextPageLink = $('a[aria-label*="Next"]').attr('href') ||
+                           $('a:contains("Next")').attr('href') ||
+                           $('a.next').attr('href') ||
+                           $(explicitNextSelector).first().attr('href');
 
         if (nextPageLink && itemCount < maxItems) {
           const nextUrl = resolveUrl(nextPageLink, url);
