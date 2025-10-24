@@ -472,8 +472,10 @@ try {
     maxItems = 100,
     includeJobDetails = true,
     proxyConfiguration = null,
-    delayBetweenRequests = 3000,
-    maxConcurrency = 1,
+    delayBetweenRequests = 1500,
+    maxConcurrency = 5,
+    minConcurrency = 1,
+    requestsPerMinute = 60,
     debugMode = false,
     cookies = '',
     cookiesJson = '',
@@ -481,6 +483,11 @@ try {
 
   const location = typeof rawLocation === 'string' ? rawLocation.trim() : '';
   let searchQuery = typeof rawSearchQuery === 'string' ? rawSearchQuery.trim() : '';
+
+  const sanitizedMaxConcurrency = Math.max(1, Number.isFinite(Number(maxConcurrency)) ? Number(maxConcurrency) : 1);
+  const sanitizedMinConcurrency = Math.max(1, Math.min(sanitizedMaxConcurrency, Number.isFinite(Number(minConcurrency)) ? Number(minConcurrency) : 1));
+  const sanitizedDelayBetweenRequests = Math.max(0, Number.isFinite(Number(delayBetweenRequests)) ? Number(delayBetweenRequests) : 0);
+  const sanitizedRequestsPerMinute = Math.max(0, Number.isFinite(Number(requestsPerMinute)) ? Number(requestsPerMinute) : 0);
 
   // apify.log may not expose getLogger in some SDK versions in the runtime.
   // Create a small prefixed wrapper to avoid relying on getLogger.
@@ -531,6 +538,7 @@ try {
 
   crawlerLog.info(`Starting Talent.com scraper - Query: "${searchQuery}", Location: "${location}", MaxItems: ${maxItems}`);
   crawlerLog.info(`Generated ${startUrls.length} start URLs`);
+  crawlerLog.info(`Configuration -> concurrency ${sanitizedMinConcurrency}-${sanitizedMaxConcurrency}, delay ${sanitizedDelayBetweenRequests}ms, rpm ${sanitizedRequestsPerMinute || 'unlimited'}, includeDetails ${includeJobDetails}`);
 
   // Parse custom cookies if provided
   let parsedCookies = [];
@@ -562,9 +570,10 @@ try {
   const crawler = new CheerioCrawler({
     proxyConfiguration: proxyConf,
     maxRequestRetries: 5,
-    maxConcurrency,
+    minConcurrency: sanitizedMinConcurrency,
+    maxConcurrency: sanitizedMaxConcurrency,
     requestHandlerTimeoutSecs: 60,
-    maxRequestsPerMinute: 30, // Rate limit: 30 requests per minute
+    maxRequestsPerMinute: sanitizedRequestsPerMinute > 0 ? sanitizedRequestsPerMinute : undefined,
     useSessionPool: true,
 
     preNavigationHooks: [
@@ -675,7 +684,7 @@ try {
         reqLog.debug(`Enqueued detail URL: ${summary.url}`);
       };
     
-      await delayRequest(delayBetweenRequests, delayBetweenRequests + 2000);
+      await delayRequest(sanitizedDelayBetweenRequests, sanitizedDelayBetweenRequests + 1000);
     
       reqLog.info(`[${userData.label}] Processing: ${url}, Status: ${response.statusCode}`);
     
