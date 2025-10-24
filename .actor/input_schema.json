@@ -7,14 +7,19 @@
     "startUrl": {
       "title": "Start URL",
       "type": "string",
-      "description": "Start scraping from a specific Remote.co search URL. If provided, this will be used instead of Keyword/Location.",
+      "description": "Start scraping from a specific Talent.com search URL. If provided, this will be used instead of Keyword/Location.",
       "editor": "textfield"
+      ,
+      "pattern": "^https?:\\/\\/(?:[a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,}(?:\\/\\S*)?$",
+      "example": "https://www.talent.com/jobs?search=developer&location=remote"
     },
     "searchQuery": {
       "title": "Search Query",
       "type": "string",
       "description": "Keyword to search for, e.g., 'developer', 'designer', 'sales'.",
-      "editor": "textfield"
+      "editor": "textfield",
+      "minLength": 1,
+      "prefill": "developer"
     },
     "location": {
       "title": "Location",
@@ -64,4 +69,6 @@
       ]
     }
   ]
+  ,
+  "additionalProperties": false
 }
