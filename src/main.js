@@ -413,3 +413,6 @@ try {
       }
     }
   });
+} catch (error) {
+  log.error('An error occurred:', error);
+}
