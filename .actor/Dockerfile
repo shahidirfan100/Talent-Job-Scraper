@@ -1,16 +1,17 @@
-FROM alpine:latest
+FROM apify/actor-node:22
 
-RUN apk add --no-cache nodejs npm
+COPY package*.json ./
 
-RUN addgroup app && adduser app -G app -D
-WORKDIR /home/app
-USER app
+RUN npm --quiet set progress=false \
+    && npm install --only=prod --no-optional \
+    && echo "Installed NPM packages:" \
+    && (npm list --only=prod --no-optional --all || true) \
+    && echo "Node.js version:" \
+    && node --version \
+    && echo "NPM version:" \
+    && npm --version \
+    && rm -r ~/.npm
 
-COPY --chown=app:app package*.json ./
-RUN npm i --omit=dev && rm -r ~/.npm || true
+COPY . ./
 
-COPY --chown=app:app . ./
-
-ENV APIFY_LOG_LEVEL=ERROR
-
-CMD npm start --silent
+CMD npm start

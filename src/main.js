@@ -344,7 +344,8 @@ try {
   const input = await Actor.getInput() || {};
 
   const {
-    location = 'Lahore',
+    startUrl = '',
+    location = '',
     searchQuery = '',
     maxPages = 5,
     maxItems = 100,
@@ -353,25 +354,62 @@ try {
     delayBetweenRequests = 3000,
     maxConcurrency = 1,
     debugMode = false,
+    cookies = '',
+    cookiesJson = '',
   } = input;
 
   const crawlerLog = log.getLogger('TALENT.COM-CRAWLER');
-  crawlerLog.info(`Starting crawler - Location: ${location}, MaxPages: ${maxPages}, MaxItems: ${maxItems}`);
+  crawlerLog.info(`Starting Talent.com scraper - Query: "${searchQuery}", Location: "${location}", MaxItems: ${maxItems}`);
 
   // Build start URLs with pagination
   const startUrls = [];
-  for (let page = 1; page <= maxPages; page++) {
-    let url = `https://www.talent.com/jobs?l=${encodeURIComponent(location)}`;
-    if (page > 1) url += `&p=${page}`;
-    if (searchQuery) url += `&q=${encodeURIComponent(searchQuery)}`;
-
+  
+  if (startUrl) {
+    // User provided a specific URL
+    crawlerLog.info(`Using custom start URL: ${startUrl}`);
     startUrls.push({
-      url,
+      url: startUrl,
       userData: {
         label: 'LIST',
-        page,
+        page: 1,
       },
     });
+  } else {
+    // Build search URLs
+    if (!searchQuery) {
+      throw new Error('Either "startUrl" or "searchQuery" must be provided in the input.');
+    }
+
+    for (let page = 1; page <= maxPages; page++) {
+      let url = `https://www.talent.com/jobs?k=${encodeURIComponent(searchQuery)}`;
+      if (location) url += `&l=${encodeURIComponent(location)}`;
+      if (page > 1) url += `&p=${page}`;
+
+      startUrls.push({
+        url,
+        userData: {
+          label: 'LIST',
+          page,
+        },
+      });
+    }
+  }
+
+  crawlerLog.info(`Generated ${startUrls.length} start URLs`);
+
+  // Parse custom cookies if provided
+  let parsedCookies = [];
+  if (cookiesJson) {
+    try {
+      const parsed = JSON.parse(cookiesJson);
+      if (Array.isArray(parsed)) {
+        parsedCookies = parsed;
+      } else if (typeof parsed === 'object') {
+        parsedCookies = Object.entries(parsed).map(([name, value]) => ({ name, value }));
+      }
+    } catch (err) {
+      crawlerLog.warning('Failed to parse cookiesJson:', err.message);
+    }
   }
 
   // Create proxy configuration for IP rotation
@@ -384,8 +422,27 @@ try {
     maxRequestRetries: 5,
     maxConcurrency,
     requestHandlerTimeoutSecs: 60,
-    maxRequestsPerMinute: 30, // Rate limit: 2 requests per second
+    maxRequestsPerMinute: 30, // Rate limit: 30 requests per minute
     useSessionPool: true,
+
+    preNavigationHooks: [
+      async ({ request, session }) => {
+        // Add custom headers and cookies
+        request.headers = {
+          ...request.headers,
+          ...BROWSER_HEADERS,
+          'User-Agent': getRandomUserAgent(),
+        };
+
+        if (cookies) {
+          request.headers.Cookie = cookies;
+        }
+
+        if (parsedCookies.length > 0 && session) {
+          session.setCookies(parsedCookies, request.url);
+        }
+      },
+    ],
 
     async requestHandler({ request, $, response, enqueueLinks, log: reqLog }) {
       const { url, userData } = request;
@@ -393,9 +450,7 @@ try {
       // ✅ ANTI-SCRAPING: Realistic delay between requests
       await delayRequest(delayBetweenRequests, delayBetweenRequests + 2000);
 
-      if (debugMode) {
-        reqLog.info(`[${userData.label}] URL: ${url}, Status: ${response.statusCode}`);
-      }
+      reqLog.info(`[${userData.label}] Processing: ${url}, Status: ${response.statusCode}`);
 
       // LISTING PAGE
       if (userData.label === 'LIST') {
@@ -409,10 +464,106 @@ try {
 
         if (jsonLdJobs.length > 0) {
           reqLog.info(`Page ${userData.page}: Found ${jsonLdJobs.length} jobs via JSON-LD`);
+
+          for (const job of jsonLdJobs) {
+            if (itemCount >= maxItems) break;
+
+            const jobData = {
+              title: job.title || '',
+              company: job.hiringOrganization?.name || '',
+              location: extractLocationFromJsonLd(job.jobLocation),
+              jobType: job.employmentType || 'Not specified',
+              salary: extractSalaryFromJsonLd(job.baseSalary) || 'Not specified',
+              description: (job.description || '').substring(0, 500),
+              datePosted: job.datePosted || '',
+              url: job.url || url,
+              source: 'talent.com',
+              scrapedAt: new Date().toISOString(),
+            };
+
+            await Dataset.pushData(jobData);
+            itemCount++;
+            reqLog.info(`✅ Saved job: ${jobData.title} at ${jobData.company} (${itemCount}/${maxItems})`);
+          }
+        } else {
+          // ✅ Strategy 2: DOM extraction (fallback)
+          reqLog.info(`Page ${userData.page}: Trying DOM extraction...`);
+          const domJobs = extractJobsFromDOM($, url);
+
+          if (domJobs.length > 0) {
+            reqLog.info(`Page ${userData.page}: Found ${domJobs.length} jobs via DOM`);
+
+            for (const job of domJobs) {
+              if (itemCount >= maxItems) break;
+
+              const jobData = {
+                ...job,
+                scrapedAt: new Date().toISOString(),
+              };
+
+              await Dataset.pushData(jobData);
+              itemCount++;
+              reqLog.info(`✅ Saved job: ${job.title} at ${job.company} (${itemCount}/${maxItems})`);
+
+              // Optionally enqueue detail pages
+              if (includeJobDetails && job.url) {
+                await enqueueLinks({
+                  urls: [job.url],
+                  userData: {
+                    label: 'DETAIL',
+                    jobId: job.url.split('id=')[1] || Math.random().toString(36).substring(7),
+                  },
+                });
+              }
+            }
+          } else {
+            reqLog.warning(`Page ${userData.page}: No jobs found. Check selectors or site structure.`);
+          }
+        }
+
+        // Check if there's a next page
+        const nextPageLink = $('a[aria-label*="Next"]').attr('href') || 
+                             $('a:contains("Next")').attr('href') ||
+                             $('a.next').attr('href');
+
+        if (nextPageLink && itemCount < maxItems) {
+          const nextUrl = resolveUrl(nextPageLink, url);
+          if (nextUrl) {
+            await enqueueLinks({
+              urls: [nextUrl],
+              userData: {
+                label: 'LIST',
+                page: (userData.page || 1) + 1,
+              },
+            });
+          }
         }
       }
-    }
+
+      // DETAIL PAGE (optional)
+      if (userData.label === 'DETAIL') {
+        const jobDetail = extractJobDetail($, url, userData.jobId);
+        await Dataset.pushData({
+          ...jobDetail,
+          scrapedAt: new Date().toISOString(),
+        });
+        reqLog.info(`✅ Saved job detail: ${jobDetail.title}`);
+      }
+    },
+
+    async failedRequestHandler({ request, error }, context) {
+      context.log.error(`Request ${request.url} failed multiple times:`, error.message);
+    },
   });
+
+  // Run the crawler
+  crawlerLog.info('🚀 Starting crawler...');
+  await crawler.run(startUrls);
+
+  crawlerLog.info(`✅ Crawl completed! Total jobs scraped: ${itemCount}`);
 } catch (error) {
-  log.error('An error occurred:', error);
+  log.error('❌ An error occurred:', error);
+  throw error;
+} finally {
+  await Actor.exit();
 }

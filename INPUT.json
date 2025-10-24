@@ -1,5 +1,8 @@
 {
-  "searchQuery": "developer",
-  "location": "",
-  "maxItems": 100
+  "searchQuery": "software developer",
+  "location": "United States",
+  "maxItems": 50,
+  "proxyConfiguration": {
+    "useApifyProxy": true
+  }
 }
