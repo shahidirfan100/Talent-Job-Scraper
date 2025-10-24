@@ -370,7 +370,14 @@ try {
   const location = typeof rawLocation === 'string' ? rawLocation.trim() : '';
   let searchQuery = typeof rawSearchQuery === 'string' ? rawSearchQuery.trim() : '';
 
-  const crawlerLog = log.getLogger('TALENT.COM-CRAWLER');
+  // apify.log may not expose getLogger in some SDK versions in the runtime.
+  // Create a small prefixed wrapper to avoid relying on getLogger.
+  const crawlerLog = {
+    info: (...args) => log.info('[TALENT.COM-CRAWLER]', ...args),
+    warning: (...args) => log.warning ? log.warning('[TALENT.COM-CRAWLER]', ...args) : log.info('[TALENT.COM-CRAWLER] WARNING', ...args),
+    error: (...args) => log.error('[TALENT.COM-CRAWLER]', ...args),
+    debug: (...args) => log.debug ? log.debug('[TALENT.COM-CRAWLER]', ...args) : log.info('[TALENT.COM-CRAWLER] DEBUG', ...args),
+  };
 
   // Runtime validation: Apify input schema doesn't support conditional
   // "either-or" requirements (e.g., at least one of startUrl or searchQuery),
