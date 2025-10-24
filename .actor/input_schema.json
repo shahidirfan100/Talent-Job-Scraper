@@ -52,7 +52,16 @@
       }
     }
   },
-  "required": [
-    "searchQuery"
+  "anyOf": [
+    {
+      "required": [
+        "startUrl"
+      ]
+    },
+    {
+      "required": [
+        "searchQuery"
+      ]
+    }
   ]
 }
