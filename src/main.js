@@ -372,6 +372,13 @@ try {
 
   const crawlerLog = log.getLogger('TALENT.COM-CRAWLER');
 
+  // Runtime validation: Apify input schema doesn't support conditional
+  // "either-or" requirements (e.g., at least one of startUrl or searchQuery),
+  // so validate here and fail fast with a clear error message.
+  if (!startUrl && !rawSearchQuery) {
+    throw new Error('Input validation error: please provide either `startUrl` (a Talent.com search URL) or `searchQuery` (keyword) in the actor input.');
+  }
+
   // Build start URLs with pagination
   const startUrls = [];
   
@@ -386,11 +393,7 @@ try {
       },
     });
   } else {
-    // Build search URLs
-    if (!searchQuery) {
-      searchQuery = 'software engineer';
-      crawlerLog.warning('No searchQuery provided. Defaulting to "software engineer".');
-    }
+    // Build search URLs from provided searchQuery
 
     for (let page = 1; page <= maxPages; page++) {
       let url = `https://www.talent.com/jobs?k=${encodeURIComponent(searchQuery)}`;

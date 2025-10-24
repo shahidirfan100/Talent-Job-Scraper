@@ -1,6 +1,6 @@
 {
   "title": "Talent.com Jobs Scraper",
-  "description": "Scrapes job listings from Talent.com using search queries and location.",
+  "description": "Scrapes job listings from Talent.com using search queries and location. Either provide a `startUrl` (Talent.com search URL) or a `searchQuery` keyword — runtime validation enforces this.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -57,18 +57,5 @@
       }
     }
   },
-  "anyOf": [
-    {
-      "required": [
-        "startUrl"
-      ]
-    },
-    {
-      "required": [
-        "searchQuery"
-      ]
-    }
-  ]
-  ,
   "additionalProperties": false
 }
