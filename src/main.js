@@ -394,47 +394,105 @@ function extractJobsFromDOM($, baseUrl) {
  * Extract detailed job information from detail page
  */
 function extractJobDetail($, baseUrl, jobId) {
-  // Try JSON-LD first (most reliable)
-  const jsonLdJobs = extractJobPostingsFromJsonLd($);
-  if (jsonLdJobs.length > 0) {
-    const job = jsonLdJobs[0];
+  // Try dedicated JSON-LD script first (most reliable on talent.com detail pages)
+  let jobFromJson = null;
+  const ldJsonText = $('#job-data-ld+json').html();
+  if (ldJsonText) {
+    try {
+      const parsed = JSON.parse(ldJsonText);
+      if (parsed?.['@type'] === 'JobPosting') {
+        jobFromJson = parsed;
+      }
+    } catch (_error) {
+      // ignore malformed JSON, fall through to other strategies
+    }
+  }
+
+  if (!jobFromJson) {
+    const jsonLdJobs = extractJobPostingsFromJsonLd($);
+    if (jsonLdJobs.length > 0) {
+      jobFromJson = jsonLdJobs.find((job) => {
+        const resolved = resolveUrl(job.url, baseUrl);
+        return resolved && resolved.split('#')[0] === baseUrl.split('#')[0];
+      }) || jsonLdJobs[0];
+    }
+  }
+
+  if (jobFromJson) {
+    const descriptionHtml = jobFromJson.description || '';
+    const descriptionText = descriptionHtml ? cheerioLoad(descriptionHtml).text() : '';
+
     return {
       jobId,
-      title: job.title || '',
-      company: job.hiringOrganization?.name || '',
-      location: extractLocationFromJsonLd(job.jobLocation),
-      jobType: job.employmentType || '',
-      salary: extractSalaryFromJsonLd(job.baseSalary),
-      description: (job.description || '').substring(0, 1000),
-      descriptionHtml: job.description || '',
-      datePosted: job.datePosted || '',
+      title: jobFromJson.title || '',
+      company: jobFromJson.hiringOrganization?.name || '',
+      location: extractLocationFromJsonLd(jobFromJson.jobLocation),
+      jobType: jobFromJson.employmentType || '',
+      salary: extractSalaryFromJsonLd(jobFromJson.baseSalary),
+      description: descriptionText.substring(0, 5000),
+      descriptionHtml,
+      datePosted: jobFromJson.datePosted || '',
       url: baseUrl,
     };
   }
 
   // Fallback to DOM extraction
-  const titleSelectors = ['h1', 'h2', '[class*="job-title"]'];
-  let title = '';
-  for (const selector of titleSelectors) {
-    const el = $(selector).first();
-    if (el.length > 0) {
-      title = el.text().trim();
-      break;
+  const titleCandidates = [];
+  $('h1, h2').each((_idx, el) => {
+    const value = $(el).text().trim();
+    if (value && value.length > 3 && !/show more/i.test(value)) {
+      titleCandidates.push(value);
+    }
+  });
+  const title = titleCandidates[0] || '';
+
+  const infoTexts = $('span')
+    .map((_idx, el) => $(el).text().trim())
+    .get()
+    .map(text => text.replace(/\s+/g, ' '))
+    .filter(text => text && !/job description/i.test(text) && !/create/i.test(text));
+
+  const company = infoTexts.find(text => !text.includes(',') && !/\bday\b|\bweek\b|\bmonth\b|ago/i.test(text)) || '';
+  const location = infoTexts.find(text => text.includes(',')) || '';
+  const datePosted = infoTexts.find(text => /\bday\b|\bweek\b|\bmonth\b|ago/i.test(text)) || '';
+
+  let jobType = '';
+  $('span').each((_idx, el) => {
+    const label = $(el).text().trim().toLowerCase();
+    if (label === 'job type') {
+      const parent = $(el).parent();
+      const valueSpan = parent.find('span').last();
+      const value = valueSpan.text().trim();
+      if (value && value.toLowerCase() !== 'job type') {
+        jobType = value;
+      }
+    }
+  });
+
+  let descriptionHtml = '';
+  const descriptionLabel = $('span').filter((_idx, el) => $(el).text().trim().toLowerCase() === 'job description').first();
+  if (descriptionLabel.length > 0) {
+    const container = descriptionLabel.parent().find('div').last();
+    if (container.length > 0) {
+      descriptionHtml = container.html() || '';
     }
   }
 
-  const descriptionSelectors = [
-    '[class*="job-description"]',
-    '[class*="description"]',
-    '.job-content',
-    'main',
-  ];
-  let descriptionHtml = '';
-  for (const selector of descriptionSelectors) {
-    const el = $(selector).first();
-    if (el.length > 0) {
-      descriptionHtml = el.html() || '';
-      break;
+  if (!descriptionHtml) {
+    const fallbackSelectors = [
+      '[class*="job-description"]',
+      '[data-testid="job-description"]',
+      '[class*="description"]',
+      '.job-content',
+      'main',
+    ];
+
+    for (const selector of fallbackSelectors) {
+      const el = $(selector).first();
+      if (el.length > 0) {
+        descriptionHtml = el.html() || '';
+        break;
+      }
     }
   }
 
@@ -443,8 +501,13 @@ function extractJobDetail($, baseUrl, jobId) {
   return {
     jobId,
     title,
-    description: descriptionText.substring(0, 1000),
+    company,
+    location,
+    jobType,
+    salary: '',
+    description: descriptionText.substring(0, 5000),
     descriptionHtml,
+    datePosted,
     url: baseUrl,
   };
 }
@@ -569,6 +632,10 @@ try {
           'User-Agent': getRandomUserAgent(),
         };
 
+        if (request.userData?.fromListUrl && !request.headers.Referer) {
+          request.headers.Referer = request.userData.fromListUrl;
+        }
+
         if (cookies) {
           request.headers.Cookie = cookies;
         }
@@ -608,6 +675,9 @@ try {
         const nextDataJobs = Array.isArray(nextData.jobs) ? nextData.jobs : [];
         let producedJobs = false;
 
+        let jsonLdJobs = [];
+        let domJobs = [];
+
         if (nextDataJobs.length > 0) {
           reqLog.info(`Page ${userData.page}: Found ${nextDataJobs.length} jobs via Next.js payload`);
 
@@ -634,7 +704,7 @@ try {
           }
         } else {
           // ✅ Strategy 2: JSON-LD extraction (fallback)
-          const jsonLdJobs = extractJobPostingsFromJsonLd($);
+          jsonLdJobs = extractJobPostingsFromJsonLd($);
 
           if (jsonLdJobs.length > 0) {
             reqLog.info(`Page ${userData.page}: Found ${jsonLdJobs.length} jobs via JSON-LD`);
@@ -665,7 +735,7 @@ try {
           } else {
             // ✅ Strategy 3: DOM extraction (last resort)
             reqLog.info(`Page ${userData.page}: Trying DOM extraction...`);
-            const domJobs = extractJobsFromDOM($, url);
+            domJobs = extractJobsFromDOM($, url);
 
             if (domJobs.length > 0) {
               reqLog.info(`Page ${userData.page}: Found ${domJobs.length} jobs via DOM`);
@@ -700,15 +770,29 @@ try {
         }
 
         // Enqueue detail pages discovered in Next.js payload or fallback strategies
-        const discoveredDetails = [
+        const discoveredDetails = new Set([
           ...(Array.isArray(nextData.detailUrls) ? nextData.detailUrls : []),
-        ];
+        ]);
 
-        if (!producedJobs && discoveredDetails.length > 0) {
-          reqLog.info(`Page ${userData.page}: Enqueuing ${discoveredDetails.length} detail pages discovered in payload`);
+        if (domJobs.length > 0) {
+          for (const job of domJobs) {
+            if (job.url) discoveredDetails.add(job.url);
+          }
+        }
+
+        if (jsonLdJobs.length > 0) {
+          for (const job of jsonLdJobs) {
+            const jobUrl = resolveUrl(job.url, url);
+            if (jobUrl) discoveredDetails.add(jobUrl);
+          }
+        }
+
+        const shouldEnqueueDetails = !producedJobs || includeJobDetails;
+
+        if (shouldEnqueueDetails && discoveredDetails.size > 0) {
+          reqLog.info(`Page ${userData.page}: Considering ${discoveredDetails.size} detail URLs for enqueueing`);
           for (const detailUrl of discoveredDetails) {
             if (itemCount >= maxItems) break;
-            if ((itemCount + enqueuedDetailUrls.size) >= maxItems) break;
             if (enqueuedDetailUrls.has(detailUrl)) continue;
 
             enqueuedDetailUrls.add(detailUrl);
@@ -717,8 +801,10 @@ try {
               userData: {
                 label: 'DETAIL',
                 jobId: detailUrl.split('id=')[1] || Math.random().toString(36).substring(7),
+                fromListUrl: url,
               },
             });
+            reqLog.debug(`Enqueued detail URL: ${detailUrl}`);
           }
         }
 
@@ -752,12 +838,15 @@ try {
         }
 
         const jobDetail = extractJobDetail($, url, userData.jobId);
-        await Actor.pushData({
+        const detailRecord = {
           ...jobDetail,
+          source: 'talent.com',
           scrapedAt: new Date().toISOString(),
-        });
+        };
+
+        await Actor.pushData(detailRecord);
         itemCount++;
-        reqLog.info(`✅ Saved job detail: ${jobDetail.title} (${itemCount}/${maxItems})`);
+        reqLog.info(`✅ Saved job detail: ${jobDetail.title || 'Untitled'} (${itemCount}/${maxItems})`);
       }
     },
 
