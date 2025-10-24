@@ -144,89 +144,81 @@ function extractSalaryFromJsonLd(baseSalary) {
 }
 
 /**
- * Extract job listings from Next.js streamed payload (jobListData)
+ * Extract job listings from Next.js streamed payload.
+ * Returns partial listing data (if available) and detail URLs discovered in the stream.
  */
 function extractJobsFromNextData(html, baseUrl) {
-  if (!html || typeof html !== 'string') return [];
+  const result = {
+    jobs: [],
+    detailUrls: [],
+  };
 
-  const key = '"jobListData":';
-  const keyIndex = html.indexOf(key);
-  if (keyIndex === -1) return [];
+  if (!html || typeof html !== 'string') return result;
 
-  let index = keyIndex + key.length;
-  while (index < html.length && /\s/.test(html[index])) index++;
-  if (html[index] !== '[') return [];
+  const chunkRegex = /self\.__next_f\.push\((\[.*?\])\)/gs;
+  const seenDetailUrls = new Set();
+  const seenJobUrls = new Set();
 
-  const start = index;
-  let depth = 0;
-  let inString = false;
-  let isEscaped = false;
-  let end = -1;
-
-  for (let i = start; i < html.length; i++) {
-    const char = html[i];
-
-    if (isEscaped) {
-      isEscaped = false;
+  for (const match of html.matchAll(chunkRegex)) {
+    const payload = match[1];
+    let items;
+    try {
+      items = JSON.parse(payload);
+    } catch (_err) {
       continue;
     }
 
-    if (char === '\\') {
-      isEscaped = true;
-      continue;
-    }
+    if (!Array.isArray(items)) continue;
 
-    if (char === '"') {
-      inString = !inString;
-      continue;
-    }
+    for (const entry of items) {
+      if (typeof entry !== 'string') continue;
 
-    if (inString) continue;
+      const trimmed = entry.trim();
+      if (!trimmed) continue;
 
-    if (char === '[') depth++;
-    if (char === ']') {
-      depth--;
-      if (depth === 0) {
-        end = i + 1;
-        break;
+      // Attempt to parse JSON fragments contained in the stream
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        let parsed;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (_err) {
+          continue;
+        }
+
+        // ItemList contains links to job detail pages
+        if (parsed?.['@type'] === 'ItemList' && Array.isArray(parsed.itemListElement)) {
+          for (const element of parsed.itemListElement) {
+            const urlCandidate = resolveUrl(element?.item?.url, baseUrl);
+            if (urlCandidate && !seenDetailUrls.has(urlCandidate)) {
+              seenDetailUrls.add(urlCandidate);
+              result.detailUrls.push(urlCandidate);
+            }
+          }
+        }
+
+        // JobPosting objects occasionally appear in the stream
+        if (parsed?.['@type'] === 'JobPosting') {
+          const urlCandidate = resolveUrl(parsed.url, baseUrl);
+          if (urlCandidate && !seenJobUrls.has(urlCandidate)) {
+            seenJobUrls.add(urlCandidate);
+            result.jobs.push({
+              title: parsed.title || '',
+              company: parsed.hiringOrganization?.name || '',
+              location: extractLocationFromJsonLd(parsed.jobLocation),
+              jobType: parsed.employmentType || '',
+              salary: extractSalaryFromJsonLd(parsed.baseSalary) || '',
+              description: (parsed.description || '').substring(0, 500),
+              datePosted: parsed.datePosted || '',
+              url: urlCandidate,
+              source: 'talent.com',
+            });
+          }
+        }
       }
     }
   }
 
-  if (end === -1) return [];
-
-  const jsonSlice = html.slice(start, end);
-  let parsed;
-  try {
-    parsed = JSON.parse(jsonSlice);
-  } catch (error) {
-    log.debug(`Failed to parse jobListData JSON: ${error.message}`);
-    return [];
-  }
-
-  if (!Array.isArray(parsed)) return [];
-
-  const seenIds = new Set();
-
-  return parsed
-    .filter(job => job && typeof job === 'object')
-    .map(job => ({
-      id: job.id || job.system_legacy_id || null,
-      title: job.source_title || job.distilled_title || job.title || '',
-      company: job.enrich_company_name || job.source_company_name || job.company || '',
-      location: job.source_location || job.enrich_geo_city || '',
-      jobType: Array.isArray(job.enrich_jobtype) ? job.enrich_jobtype.join(', ') : job.employmentType || '',
-      salary: job.enrich_salary_snippet || job.salary || '',
-      description: (job.source_jobdesc_text || job.description || '').substring(0, 500),
-      datePosted: job.system_date_found || job.datePosted || '',
-      url: resolveUrl(job.source_link || job.url || '', baseUrl),
-    }))
-    .filter(job => {
-      if (!job.title || !job.url) return false;
-      if (seenIds.has(job.url)) return false;
-      seenIds.add(job.url);
-      return true;
-    });
+  return result;
 }
 
 /**
@@ -558,6 +550,7 @@ try {
   }
 
   let itemCount = 0;
+  const enqueuedDetailUrls = new Set();
 
   const crawler = new CheerioCrawler({
     proxyConfiguration: proxyConf,
@@ -586,13 +579,17 @@ try {
       },
     ],
 
-    async requestHandler({ request, $, response, enqueueLinks, log: reqLog }) {
+    async requestHandler({ request, $, response, body, enqueueLinks, log: reqLog }) {
       const { url, userData } = request;
-      const responseBody = typeof response?.body === 'string'
-        ? response.body
-        : Buffer.isBuffer(response?.body)
-          ? response.body.toString('utf8')
-          : '';
+      const responseBody = typeof body === 'string'
+        ? body
+        : Buffer.isBuffer(body)
+          ? body.toString('utf8')
+          : typeof response?.body === 'string'
+            ? response.body
+            : Buffer.isBuffer(response?.body)
+              ? response.body.toString('utf8')
+              : '';
 
       // ✅ ANTI-SCRAPING: Realistic delay between requests
       await delayRequest(delayBetweenRequests, delayBetweenRequests + 2000);
@@ -607,7 +604,9 @@ try {
         }
 
         // ✅ Strategy 1: Next.js payload extraction
-        const nextDataJobs = extractJobsFromNextData(responseBody, url);
+        const nextData = extractJobsFromNextData(responseBody, url);
+        const nextDataJobs = Array.isArray(nextData.jobs) ? nextData.jobs : [];
+        let producedJobs = false;
 
         if (nextDataJobs.length > 0) {
           reqLog.info(`Page ${userData.page}: Found ${nextDataJobs.length} jobs via Next.js payload`);
@@ -631,6 +630,7 @@ try {
             await Actor.pushData(jobData);
             itemCount++;
             reqLog.info(`✅ Saved job: ${jobData.title} at ${jobData.company} (${itemCount}/${maxItems})`);
+            producedJobs = true;
           }
         } else {
           // ✅ Strategy 2: JSON-LD extraction (fallback)
@@ -660,6 +660,7 @@ try {
               await Actor.pushData(jobData);
               itemCount++;
               reqLog.info(`✅ Saved job: ${jobData.title} at ${jobData.company} (${itemCount}/${maxItems})`);
+              producedJobs = true;
             }
           } else {
             // ✅ Strategy 3: DOM extraction (last resort)
@@ -680,6 +681,7 @@ try {
                 await Actor.pushData(jobData);
                 itemCount++;
                 reqLog.info(`✅ Saved job: ${job.title} at ${job.company} (${itemCount}/${maxItems})`);
+                producedJobs = true;
 
                 if (includeJobDetails && job.url) {
                   await enqueueLinks({
@@ -694,6 +696,29 @@ try {
             } else {
               reqLog.warning(`Page ${userData.page}: No jobs found. Check selectors or site structure.`);
             }
+          }
+        }
+
+        // Enqueue detail pages discovered in Next.js payload or fallback strategies
+        const discoveredDetails = [
+          ...(Array.isArray(nextData.detailUrls) ? nextData.detailUrls : []),
+        ];
+
+        if (!producedJobs && discoveredDetails.length > 0) {
+          reqLog.info(`Page ${userData.page}: Enqueuing ${discoveredDetails.length} detail pages discovered in payload`);
+          for (const detailUrl of discoveredDetails) {
+            if (itemCount >= maxItems) break;
+            if ((itemCount + enqueuedDetailUrls.size) >= maxItems) break;
+            if (enqueuedDetailUrls.has(detailUrl)) continue;
+
+            enqueuedDetailUrls.add(detailUrl);
+            await enqueueLinks({
+              urls: [detailUrl],
+              userData: {
+                label: 'DETAIL',
+                jobId: detailUrl.split('id=')[1] || Math.random().toString(36).substring(7),
+              },
+            });
           }
         }
 
@@ -721,12 +746,18 @@ try {
 
       // DETAIL PAGE (optional)
       if (userData.label === 'DETAIL') {
+        if (itemCount >= maxItems) {
+          reqLog.info(`Max items (${maxItems}) reached before detail processing; skipping ${url}`);
+          return;
+        }
+
         const jobDetail = extractJobDetail($, url, userData.jobId);
         await Actor.pushData({
           ...jobDetail,
           scrapedAt: new Date().toISOString(),
         });
-        reqLog.info(`✅ Saved job detail: ${jobDetail.title}`);
+        itemCount++;
+        reqLog.info(`✅ Saved job detail: ${jobDetail.title} (${itemCount}/${maxItems})`);
       }
     },
 
