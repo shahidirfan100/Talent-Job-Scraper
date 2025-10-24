@@ -35,6 +35,15 @@ const BROWSER_HEADERS = {
 };
 
 /**
+ * Normalize @type fields that can be strings or arrays
+ */
+function isJobPostingType(value) {
+  if (!value) return false;
+  if (Array.isArray(value)) return value.includes('JobPosting');
+  return value === 'JobPosting';
+}
+
+/**
  * Get random user agent for rotation (anti-bot detection)
  */
 function getRandomUserAgent() {
@@ -66,16 +75,16 @@ function extractJobPostingsFromJsonLd($) {
       // Handle different JSON-LD structures
       if (Array.isArray(data)) {
         data.forEach((item) => {
-          if (item['@type'] === 'JobPosting') {
+          if (isJobPostingType(item['@type'])) {
             found.push(item);
           }
         });
-      } else if (data['@type'] === 'JobPosting') {
+      } else if (isJobPostingType(data['@type'])) {
         found.push(data);
       } else if (data['@graph']) {
         const graph = Array.isArray(data['@graph']) ? data['@graph'] : [data['@graph']];
         graph.forEach((item) => {
-          if (item['@type'] === 'JobPosting') {
+          if (isJobPostingType(item['@type'])) {
             found.push(item);
           }
         });
@@ -429,7 +438,7 @@ try {
       async ({ request, session }) => {
         // Add custom headers and cookies
         request.headers = {
-          ...request.headers,
+          ...(request.headers ?? {}),
           ...BROWSER_HEADERS,
           'User-Agent': getRandomUserAgent(),
         };
@@ -468,6 +477,8 @@ try {
           for (const job of jsonLdJobs) {
             if (itemCount >= maxItems) break;
 
+            const jobUrl = resolveUrl(job.url, url) || url;
+
             const jobData = {
               title: job.title || '',
               company: job.hiringOrganization?.name || '',
@@ -476,7 +487,7 @@ try {
               salary: extractSalaryFromJsonLd(job.baseSalary) || 'Not specified',
               description: (job.description || '').substring(0, 500),
               datePosted: job.datePosted || '',
-              url: job.url || url,
+              url: jobUrl,
               source: 'talent.com',
               scrapedAt: new Date().toISOString(),
             };
