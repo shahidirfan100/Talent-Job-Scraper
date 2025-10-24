@@ -354,8 +354,8 @@ try {
 
   const {
     startUrl = '',
-    location = '',
-    searchQuery = '',
+    location: rawLocation = '',
+    searchQuery: rawSearchQuery = '',
     maxPages = 5,
     maxItems = 100,
     includeJobDetails = false,
@@ -367,8 +367,10 @@ try {
     cookiesJson = '',
   } = input;
 
+  const location = typeof rawLocation === 'string' ? rawLocation.trim() : '';
+  let searchQuery = typeof rawSearchQuery === 'string' ? rawSearchQuery.trim() : '';
+
   const crawlerLog = log.getLogger('TALENT.COM-CRAWLER');
-  crawlerLog.info(`Starting Talent.com scraper - Query: "${searchQuery}", Location: "${location}", MaxItems: ${maxItems}`);
 
   // Build start URLs with pagination
   const startUrls = [];
@@ -386,7 +388,8 @@ try {
   } else {
     // Build search URLs
     if (!searchQuery) {
-      throw new Error('Either "startUrl" or "searchQuery" must be provided in the input.');
+      searchQuery = 'software engineer';
+      crawlerLog.warning('No searchQuery provided. Defaulting to "software engineer".');
     }
 
     for (let page = 1; page <= maxPages; page++) {
@@ -404,6 +407,7 @@ try {
     }
   }
 
+  crawlerLog.info(`Starting Talent.com scraper - Query: "${searchQuery}", Location: "${location}", MaxItems: ${maxItems}`);
   crawlerLog.info(`Generated ${startUrls.length} start URLs`);
 
   // Parse custom cookies if provided
@@ -422,7 +426,12 @@ try {
   }
 
   // Create proxy configuration for IP rotation
-  const proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
+  let proxyConf;
+  try {
+    proxyConf = await Actor.createProxyConfiguration(proxyConfiguration ?? undefined);
+  } catch (proxyError) {
+    crawlerLog.warning(`Proxy configuration failed: ${proxyError.message}. Proceeding without proxy.`);
+  }
 
   let itemCount = 0;
 
@@ -573,8 +582,10 @@ try {
 
   crawlerLog.info(`✅ Crawl completed! Total jobs scraped: ${itemCount}`);
 } catch (error) {
-  log.error('❌ An error occurred:', error);
+  log.error(`❌ An error occurred: ${error.message}`);
+  if (error.stack) log.debug(error.stack);
   throw error;
 } finally {
   await Actor.exit();
 }
+
